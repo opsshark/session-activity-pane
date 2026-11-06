@@ -1,0 +1,10 @@
+{
+  "name": "session-activity-pane",
+  "version": "0.1.0",
+  "description": "A Sessions pane inside Claude Code: every session's state, its question and reply buttons, and its step list. Open it with /sessions.",
+  "author": {
+    "name": "Travis Alexander"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

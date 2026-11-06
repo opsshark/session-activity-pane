@@ -1,0 +1,6 @@
+{
+  "name": "session-activity-pane",
+  "owner": { "name": "Travis Alexander" },
+  "description": "A Sessions pane inside Claude Code that shows every session at once",
+  "plugins": [{ "name": "session-activity-pane", "source": "./" }]
+}
