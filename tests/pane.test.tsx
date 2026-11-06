@@ -307,3 +307,32 @@ test('a reply nobody acts on within 30 seconds says so', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /didn't go through/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('text from session files is scrubbed, and malformed or misnamed files are ignored', async ($, on) => {
+  const w = world(on, { now: NOW, store: { paneOpen: true } })
+  const ESC = String.fromCharCode(27)
+  w.seed('S2', {
+    title: `Evil${ESC}[2J title`,
+    state: 'needs',
+    ask: { text: `Ship${ESC}]0;pwned${String.fromCharCode(7)} it?`, buttons: ['Yes', 42, { x: 1 }, `No${ESC}[31m`], at: NOW },
+    steps: [{ id: 'a', text: `Step${ESC}[1m one`, status: 'completed' }, { id: 'b', text: 7, status: 'pending' }, 'junk'],
+  })
+  // An id that doesn't match its file name (here aiming outside replies/) is dropped.
+  w.files.set(`${DIR}/sessions/S3.json`, JSON.stringify({ v: 1, id: '../../evil', state: 'needs', changedAt: NOW, beatAt: NOW, steps: [] }))
+  // Wrong types are dropped.
+  w.files.set(`${DIR}/sessions/S4.json`, JSON.stringify({ v: 1, id: 'S4', state: 'needs', changedAt: 'soon', beatAt: NOW, steps: [] }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+  expect(texts.includes(ESC)).toBe(false)
+  expect(texts.includes(String.fromCharCode(7))).toBe(false)
+  expect(texts).toContain('Evil [2J title')
+  expect((await ui.find({ type: 'Text', text: /need.*you/ }))?.text).toBe('● 1 needs you')
+  const buttons = (await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('reply:S2:'))
+  expect(buttons.length).toBe(2)
+  await ui.press({ key: 'fold:S2' })
+  expect(await ui.find({ type: 'Text', text: 'Step [1m one' })).toBeDefined()
+  expect([...w.files.keys()].some(p => p.includes('evil'))).toBe(false)
+  await ui.unmount()
+})

@@ -67,8 +67,18 @@ type Args = Record<string, unknown>
 
 const STEP_STATUSES: readonly StepStatus[] = ['pending', 'in_progress', 'completed']
 
+// Control characters (terminal escapes among them) and bidi overrides, which no
+// title, question or step needs and which could garble or disguise what the pane draws.
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g
+
+function scrub(text: string): string {
+  return text.replace(CONTROL, ' ')
+}
+
 function asText(raw: unknown): string | undefined {
-  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined
+  if (typeof raw !== 'string') return undefined
+  const text = scrub(raw).trim()
+  return text === '' ? undefined : text
 }
 
 function asStepStatus(raw: unknown): StepStatus {
@@ -147,13 +157,13 @@ function applyWrapUp(a: Activity, args: Args, now: number): Activity {
 }
 
 function clip(text: string, max: number): string {
-  const one = text.replace(/\s+/g, ' ').trim()
+  const one = scrub(text).replace(/\s+/g, ' ').trim()
   return one.length > max ? one.slice(0, max - 1).trimEnd() + '…' : one
 }
 
 /** The prompt's first words, as the session's topic; none for an event the engine raised. */
 function topicOf(text: string): string | undefined {
-  const t = text.replace(/\s+/g, ' ').trim()
+  const t = scrub(text).replace(/\s+/g, ' ').trim()
   if (t === '' || t.startsWith('<')) return undefined
   return clip(t, TOPIC_MAX)
 }
@@ -343,18 +353,75 @@ function ago(ms: number, now: number): string {
   return h < 48 ? `${h}h` : `${Math.floor(h / 24)}d`
 }
 
-function isRecord(value: unknown): value is ActivityRecord {
-  const r = value as Partial<ActivityRecord> | null
-  return (
-    typeof r === 'object' &&
-    r !== null &&
-    r.v === 1 &&
-    typeof r.id === 'string' &&
-    typeof r.state === 'string' &&
-    typeof r.changedAt === 'number' &&
-    typeof r.beatAt === 'number' &&
-    Array.isArray(r.steps)
-  )
+/** Session ids name files: letters, digits, - and _ only, so a click never writes outside replies/. */
+const SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/
+const STATES: readonly SessionState[] = ['idle', 'working', 'needs', 'stopped', 'done', 'closed']
+const MAX_STEPS = 50
+const MAX_BUTTONS = 6
+
+function cleanText(raw: unknown, max: number): string | undefined {
+  const text = asText(raw)
+  return text === undefined ? undefined : clip(text, max)
+}
+
+function isTime(raw: unknown): raw is number {
+  return typeof raw === 'number' && Number.isFinite(raw)
+}
+
+/**
+ * A record as the pane may use it: any session, or any other program, can write
+ * that folder, so every field is checked and every string scrubbed and clipped.
+ * The id must match the file's own name.
+ */
+function parseRecord(value: unknown, fileId: string): ActivityRecord | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const r = value as Args
+  if (r.v !== 1 || r.id !== fileId || !SESSION_ID.test(fileId)) return undefined
+  if (!STATES.includes(r.state as SessionState) || !isTime(r.changedAt) || !isTime(r.beatAt)) return undefined
+  const steps: ActivityStep[] = []
+  if (Array.isArray(r.steps)) {
+    for (const [i, one] of r.steps.slice(0, MAX_STEPS).entries()) {
+      if (one === null || typeof one !== 'object') continue
+      const step = one as Args
+      const text = cleanText(step.text, 200)
+      if (text === undefined) continue
+      steps.push({ id: cleanText(step.id, 64) ?? `step-${i + 1}`, text, status: asStepStatus(step.status) })
+    }
+  }
+  const record: ActivityRecord = {
+    v: 1,
+    id: fileId,
+    name: cleanText(r.name, 80) ?? 'session',
+    state: r.state as SessionState,
+    changedAt: r.changedAt,
+    beatAt: r.beatAt,
+    steps,
+  }
+  const title = cleanText(r.title, 120)
+  if (title) record.title = title
+  if (typeof r.hostId === 'string' && HOST_ID.test(r.hostId)) record.hostId = r.hostId
+  const topic = cleanText(r.topic, TOPIC_MAX)
+  if (topic) record.topic = topic
+  const question = cleanText(r.question, 600)
+  if (question) record.question = question
+  const reason = cleanText(r.reason, 120)
+  if (reason) record.reason = reason
+  const recap = cleanText(r.recap, RECAP_MAX)
+  if (recap) record.recap = recap
+  const handled = cleanText(r.handledReply, 128)
+  if (handled) record.handledReply = handled
+  if (r.ask !== null && typeof r.ask === 'object') {
+    const ask = r.ask as Args
+    const text = cleanText(ask.text, 600)
+    const buttons = Array.isArray(ask.buttons)
+      ? ask.buttons
+          .map(label => cleanText(label, 60))
+          .filter((label): label is string => label !== undefined)
+          .slice(0, MAX_BUTTONS)
+      : []
+    if (text) record.ask = { text, buttons, at: isTime(ask.at) ? ask.at : record.changedAt }
+  }
+  return record
 }
 
 function makeRow(a: ActivityRecord, now: number): PaneRow | undefined {
@@ -424,7 +491,8 @@ async function refresh($: EngineInterface): Promise<void> {
     if (entry.mtimeMs > 0 && now - entry.mtimeMs > OLDEST_MS) continue
     try {
       const parsed: unknown = JSON.parse(String(await $.fs.read(`${dir}/${entry.name}`)))
-      if (isRecord(parsed)) records.push(parsed)
+      const record = parseRecord(parsed, entry.name.slice(0, -'.json'.length))
+      if (record) records.push(record)
     } catch {
       // A record mid-write, or not ours: the next poll reads it.
     }
@@ -474,7 +542,7 @@ async function openPane($: EngineInterface): Promise<void> {
 
 async function sendReply($: EngineInterface, row: PaneRow, label: string): Promise<void> {
   const ask = row.ask
-  if (ask === undefined) return
+  if (ask === undefined || !SESSION_ID.test(row.id)) return
   const home = await homeOf($)
   const now = await $.clock.now()
   const reply: ReplyFile = { id: `r${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`, label, ask: ask.text, at: now }
